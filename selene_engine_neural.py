@@ -1,17 +1,15 @@
 
 """
-SELENE ENGINE v35 — STRATEGIC + STABLE AGENT SYSTEM
+SELENE ENGINE v50 — STABLE COGNITIVE STACK + CURRICULUM
 
-Upgrades from v34:
-✔ Value-guided planning (MCTS-lite scoring)
-✔ Learned mutation scaling (meta-gradient inspired)
-✔ Stabilized policy updates (hybrid learning)
-✔ Persistent agent identity embeddings
-✔ Improved communication channel (learned signals)
-✔ Better planning horizon
+✔ Fixed PPO shapes + minibatching
+✔ Transformer memory + communication
+✔ Latent world model
+✔ Planning aligned with reward
+✔ Curriculum learning (easy → hard)
 
 Run:
-python selene_engine_v35.py --mode train
+python selene_engine_v50.py --mode train
 """
 
 import argparse, random
@@ -23,121 +21,100 @@ import torch.optim as optim
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 NUM_SHARDS = 8
-SEQ_LEN = 6
-PLAN_STEPS = 5
-PLAN_BRANCH = 6
+NUM_ENVS = 4
+SEQ_LEN = 12
+ROLLOUT = 128
+PPO_EPOCHS = 4
+MINIBATCH = 128
+GAMMA = 0.99
+CLIP = 0.2
+DT = 0.05
 
-# ================= IDENTITY =================
-class Identity(nn.Module):
+# ================= WORLD MODEL =================
+class LatentWorld(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embed = nn.Embedding(NUM_SHARDS, 16)
+        self.encoder = nn.Sequential(nn.Linear(4,64), nn.ReLU(), nn.Linear(64,64))
+        self.dynamics = nn.Sequential(nn.Linear(66,128), nn.ReLU(), nn.Linear(128,64))
+        self.decoder = nn.Sequential(nn.Linear(64,64), nn.ReLU(), nn.Linear(64,4))
 
-    def forward(self, ids):
-        return self.embed(ids)
+    def forward(self,s,a):
+        z = self.encoder(s)
+        z_next = self.dynamics(torch.cat([z,a],dim=-1))
+        s_next = self.decoder(z_next)
+        return s_next
+
+world_model = LatentWorld().to(DEVICE)
 
 # ================= MEMORY =================
 class Memory(nn.Module):
     def __init__(self):
         super().__init__()
-        self.rnn = nn.GRU(4, 64, batch_first=True)
+        self.embed = nn.Linear(4,64)
+        layer = nn.TransformerEncoderLayer(64,4,batch_first=True)
+        self.tr = nn.TransformerEncoder(layer,2)
 
-    def forward(self, seq):
+    def forward(self,seq):
         B,T,N,F = seq.shape
-        seq = seq.view(B*N, T, F)
-        out,_ = self.rnn(seq)
-        return out[:,-1].view(B,N,64)
+        x = seq.view(B*N,T,F)
+        x = self.embed(x)
+        x = self.tr(x)
+        return x[:,-1].view(B,N,64)
 
 # ================= COMM =================
 class Comm(nn.Module):
     def __init__(self):
         super().__init__()
-        self.msg = nn.Linear(64+16, 32)
+        self.msg = nn.Linear(64,32)
+        self.gate = nn.Linear(64,32)
 
-    def forward(self, h, id_emb):
-        x = torch.cat([h, id_emb], dim=-1)
-        msgs = self.msg(x)
-        return msgs.mean(dim=1, keepdim=True).repeat(1, h.shape[1], 1)
-
-# ================= ATTENTION =================
-class Attention(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.q = nn.Linear(112,112)
-        self.k = nn.Linear(112,112)
-        self.v = nn.Linear(112,112)
-
-    def forward(self, h):
-        Q,K,V = self.q(h), self.k(h), self.v(h)
-        attn = torch.softmax(Q @ K.transpose(-1,-2) / np.sqrt(112), dim=-1)
-        return attn @ V
+    def forward(self,h):
+        m = self.msg(h)
+        g = torch.sigmoid(self.gate(h))
+        return (m*g).mean(dim=1,keepdim=True).repeat(1,h.shape[1],1)
 
 # ================= POLICY =================
 class Policy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.memory = Memory()
-        self.identity = Identity()
+        self.mem = Memory()
         self.comm = Comm()
-        self.attn = Attention()
-
         self.head = nn.Sequential(
-            nn.Linear(112,128), nn.ReLU(),
+            nn.Linear(96,128), nn.ReLU(),
             nn.Linear(128,128), nn.ReLU()
         )
-
         self.mean = nn.Linear(128,2)
         self.value = nn.Linear(128,1)
+        self.log_std = nn.Parameter(torch.zeros(2))
 
-    def forward(self, seq):
-        B,T,N,F = seq.shape
-        ids = torch.arange(N, device=DEVICE).unsqueeze(0).repeat(B,1)
-
-        h = self.memory(seq)
-        id_emb = self.identity(ids)
-
-        c = self.comm(h, id_emb)
-        h = torch.cat([h, id_emb, c], dim=-1)
-
-        h = self.attn(h)
-        h = self.head(h)
-
-        return self.mean(h), self.value(h)
+    def forward(self,seq):
+        h = self.mem(seq)
+        c = self.comm(h)
+        x = torch.cat([h,c],dim=-1)
+        x = self.head(x)
+        return self.mean(x), self.value(x)
 
 policy = Policy().to(DEVICE)
 
-# ================= WORLD MODEL =================
-class WorldModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(6,128), nn.ReLU(),
-            nn.Linear(128,128), nn.ReLU(),
-            nn.Linear(128,4)
-        )
-
-    def forward(self, s,a):
-        return self.net(torch.cat([s,a], dim=-1))
-
-world_model = WorldModel().to(DEVICE)
-
 # ================= ENV =================
-def wrap_du(a,b):
+def wrap(a,b):
     d=a-b
     if abs(d)>0.5: d-=np.sign(d)
     return d
 
 def dist(a,b):
-    du=wrap_du(a[0],b[0])
+    du=wrap(a[0],b[0])
     dv=np.arctan2(np.sin(a[1]-b[1]),np.cos(a[1]-b[1]))
     return np.sqrt(du**2+dv**2)
 
 class Env:
-    def __init__(self,seed):
+    def __init__(self,seed, difficulty=1.0):
         self.rng=random.Random(seed)
+        self.diff=difficulty
         self.reset()
 
     def reset(self):
+        spread = 1.0 * self.diff
         self.pos=np.array([[self.rng.random(), self.rng.uniform(0,2*np.pi)] for _ in range(NUM_SHARDS)],dtype=np.float32)
         self.vel=np.zeros((NUM_SHARDS,2),dtype=np.float32)
         self.leader=self.rng.randrange(NUM_SHARDS)
@@ -146,7 +123,7 @@ class Env:
     def obs(self):
         o=[]
         for i in range(NUM_SHARDS):
-            du=wrap_du(self.pos[self.leader][0],self.pos[i][0])
+            du=wrap(self.pos[self.leader][0],self.pos[i][0])
             dv=np.arctan2(np.sin(self.pos[self.leader][1]-self.pos[i][1]),
                           np.cos(self.pos[self.leader][1]-self.pos[i][1]))
             o.append([self.pos[i][0],self.pos[i][1],du,dv])
@@ -163,85 +140,118 @@ class Env:
                 self.leader=i
                 break
 
-        reward=-np.mean([dist(self.pos[self.leader],self.pos[i]) for i in range(NUM_SHARDS)])
+        avg_dist=np.mean([dist(self.pos[self.leader],self.pos[i]) for i in range(NUM_SHARDS)])
+        reward = -avg_dist * self.diff
         return self.obs(), reward, False, {}
 
-# ================= VALUE-GUIDED PLANNING =================
-def plan(seq):
-    seq_t = torch.tensor(seq, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+# ================= PLANNING =================
+def plan(obs):
+    s = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
+    best=None; best_score=-1e9
 
-    best_score = -1e9
-    best_act = None
+    for _ in range(4):
+        a = torch.randn(NUM_SHARDS,2,device=DEVICE)*0.1
+        pred = world_model(s,a)
+        score = -((pred[:,2:]**2).mean())
+        if score>best_score:
+            best_score=score; best=a
 
-    for _ in range(PLAN_BRANCH):
-        act = torch.randn((NUM_SHARDS,2), device=DEVICE)*0.1
-        sim = seq_t.clone()
-
-        score = 0
-        for _ in range(PLAN_STEPS):
-            s = sim[:,-1]
-            pred = world_model(s, act)
-
-            _, val = policy(sim)
-            score += val.mean().item() - pred.norm().item()
-
-        if score > best_score:
-            best_score = score
-            best_act = act
-
-    return best_act.detach().cpu().numpy()
-
-# ================= META LEARNING =================
-def meta_update(policy, loss):
-    scale = float(torch.sigmoid(loss).item()) * 0.01
-    with torch.no_grad():
-        for p in policy.parameters():
-            p.add_(torch.randn_like(p) * scale)
+    return best.cpu().numpy()
 
 # ================= TRAIN =================
-def train(epochs=60):
-    env = Env(42)
+def train(epochs=80):
+    opt = optim.Adam(policy.parameters(), lr=3e-4)
     wm_opt = optim.Adam(world_model.parameters(), lr=3e-4)
 
     for ep in range(epochs):
-        seq_buf=[]
-        obs=env.reset()
 
-        for _ in range(SEQ_LEN):
-            seq_buf.append(obs)
+        difficulty = min(1.0 + ep/50.0, 2.0)  # curriculum ramp
+        envs=[Env(42+i, difficulty) for i in range(NUM_ENVS)]
 
-        for _ in range(250):
-            seq = np.array(seq_buf[-SEQ_LEN:])
-            act = plan(seq)
+        obs_list=[env.reset() for env in envs]
+        seqs=[[obs.copy() for _ in range(SEQ_LEN)] for obs in obs_list]
 
-            next_obs,_,_,_ = env.step(act)
+        obs_buf=[]; act_buf=[]; logp_buf=[]; val_buf=[]; rew_buf=[]
 
-            s = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
-            a = torch.tensor(act, dtype=torch.float32, device=DEVICE)
-            target = torch.tensor(next_obs, dtype=torch.float32, device=DEVICE)
+        for _ in range(ROLLOUT):
+            seq_batch = torch.tensor([np.array(s[-SEQ_LEN:]) for s in seqs], dtype=torch.float32, device=DEVICE)
 
-            pred = world_model(s,a)
-            loss = ((pred-target)**2).mean()
+            mean,val = policy(seq_batch)
+            distn = torch.distributions.Normal(mean, torch.exp(policy.log_std))
+            act = distn.sample()
 
-            wm_opt.zero_grad()
-            loss.backward()
-            wm_opt.step()
+            next_obs_list=[]; rewards=[]
+            for i,env in enumerate(envs):
+                planned = plan(obs_list[i])
+                blended = 0.7*act[i].cpu().detach().numpy() + 0.3*planned
 
-            obs = next_obs
-            seq_buf.append(obs)
+                next_obs,r,_,_=env.step(blended)
+                next_obs_list.append(next_obs); rewards.append(r)
 
-        meta_update(policy, loss)
+                # world model update
+                s = torch.tensor(obs_list[i], dtype=torch.float32, device=DEVICE)
+                a = torch.tensor(blended, dtype=torch.float32, device=DEVICE)
+                target = torch.tensor(next_obs, dtype=torch.float32, device=DEVICE)
 
-        print(f"Epoch {ep} | WM Loss {loss.item():.4f}")
+                wm_loss=((world_model(s,a)-target)**2).mean()
+                wm_opt.zero_grad(); wm_loss.backward(); wm_opt.step()
 
-    torch.save(policy.state_dict(),"selene_v35_policy.pt")
-    torch.save(world_model.state_dict(),"selene_v35_world.pt")
+            obs_buf.append(seq_batch)
+            act_buf.append(act)
+            logp_buf.append(distn.log_prob(act).sum(-1).mean(dim=1))
+            val_buf.append(val.mean(dim=1))
+            rew_buf.append(torch.tensor(rewards,device=DEVICE))
+
+            obs_list=next_obs_list
+            for i in range(NUM_ENVS):
+                seqs[i].append(obs_list[i])
+
+        returns=[]
+        G=torch.zeros(NUM_ENVS,device=DEVICE)
+        for r in reversed(rew_buf):
+            G=r+GAMMA*G
+            returns.insert(0,G)
+        returns=torch.stack(returns)
+
+        values=torch.stack(val_buf)
+        adv=(returns-values.detach())
+        adv=(adv-adv.mean())/(adv.std()+1e-8)
+
+        obs_flat=torch.cat(obs_buf)
+        act_flat=torch.cat(act_buf)
+        logp_old=torch.cat(logp_buf).detach()
+        adv_flat=adv.view(-1)
+        returns_flat=returns.view(-1)
+
+        for _ in range(PPO_EPOCHS):
+            idx=torch.randperm(len(obs_flat))
+            for start in range(0,len(idx),MINIBATCH):
+                mb=idx[start:start+MINIBATCH]
+
+                mean,val=policy(obs_flat[mb])
+                distn=torch.distributions.Normal(mean, torch.exp(policy.log_std))
+                logp=distn.log_prob(act_flat[mb]).sum(-1).mean(dim=1)
+
+                ratio=torch.exp(logp-logp_old[mb])
+                s1=ratio*adv_flat[mb]
+                s2=torch.clamp(ratio,1-CLIP,1+CLIP)*adv_flat[mb]
+
+                policy_loss=-torch.min(s1,s2).mean()
+                value_loss=0.5*(val.mean(dim=1)-returns_flat[mb]).pow(2).mean()
+
+                loss=policy_loss+value_loss
+
+                opt.zero_grad(); loss.backward(); opt.step()
+
+        print(f"Epoch {ep} | Difficulty {difficulty:.2f}")
+
+    torch.save(policy.state_dict(),"selene_v50.pt")
 
 # ================= CLI =================
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["train"], default="train")
-    args = p.parse_args()
+if __name__=="__main__":
+    p=argparse.ArgumentParser()
+    p.add_argument("--mode",choices=["train"],default="train")
+    args=p.parse_args()
 
-    if args.mode == "train":
+    if args.mode=="train":
         train()
